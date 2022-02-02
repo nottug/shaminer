@@ -161,7 +161,7 @@ int main(int argc, char *argv[]) {
 
   // initialize loop variables
   static uint64_t nonce = 0;
-  size_t dynamic_shared_size =
+  size_t shared_size =
       (ceil((job.input_size + 1) / 8.f) * 8) + (64 * BLOCK_SIZE);
 
   // initialize hashrate values
@@ -172,8 +172,7 @@ int main(int argc, char *argv[]) {
 
   // loop until solution has been found
   while (!*sol.found) {
-    sha256_kernel<<<NUM_BLOCKS, BLOCK_SIZE, dynamic_shared_size>>>(job, nonce,
-                                                                   sol);
+    sha256_kernel<<<NUM_BLOCKS, BLOCK_SIZE, shared_size>>>(job, nonce, sol);
 
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
