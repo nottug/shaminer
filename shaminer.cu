@@ -9,6 +9,19 @@
 #define BLOCK_SIZE 512
 #define NUM_BLOCKS (SHA_PER_ITERATIONS + BLOCK_SIZE - 1) / BLOCK_SIZE
 
+struct Job {
+  char *input;
+  size_t input_size;
+  char *target;
+  size_t target_size;
+};
+
+struct Solution {
+  int *found;
+  char *nonce;
+  unsigned char *hash;
+};
+
 // get current time
 time_t get_time_ms() {
   struct timeval time_now {};
@@ -78,15 +91,12 @@ void sha256_preflight() {
 }
 
 extern __shared__ char input_array[];
-__global__ void sha256_kernel(char *input, size_t input_size, char *target,
-                              size_t target_size, uint64_t nonce_offset,
-                              int *sol_found, char *sol_nonce,
-                              unsigned char *sol_hash) {
+__global__ void sha256_kernel(Job job, uint64_t nonce_offset, Solution sol) {
   // If this is the first thread of the block, init the seed string in shared
   // memory
   char *seed = (char *)&input_array[0];
   if (threadIdx.x == 0) {
-    memcpy(seed, input, input_size + 1);
+    memcpy(seed, job.input, job.input_size + 1);
   }
 
   __syncthreads(); // wait for seed string to be written in shared memory
@@ -97,7 +107,7 @@ __global__ void sha256_kernel(char *input, size_t input_size, char *target,
   // the first byte we can write because there is the input string at the
   // begining respects the memory padding of 8 bit (char)
   size_t const min_array =
-      static_cast<size_t>(ceil((input_size + 1) / 8.f) * 8);
+      static_cast<size_t>(ceil((job.input_size + 1) / 8.f) * 8);
 
   uintptr_t hash_addr = threadIdx.x * (64) + min_array;
   uintptr_t nonce_addr = hash_addr + 32;
@@ -110,14 +120,15 @@ __global__ void sha256_kernel(char *input, size_t input_size, char *target,
   {
     SHA256_CTX ctx;
     sha256_init(&ctx);
-    sha256_update(&ctx, (unsigned char *)seed, input_size);
+    sha256_update(&ctx, (unsigned char *)seed, job.input_size);
     sha256_update(&ctx, nonce, nonce_size);
     sha256_final(&ctx, hash);
   }
 
-  if (check_hash(hash, target, target_size) && atomicExch(sol_found, 1) == 0) {
-    memcpy(sol_hash, hash, 32);
-    memcpy(sol_nonce, nonce, nonce_size);
+  if (check_hash(hash, job.target, job.target_size) &&
+      atomicExch(sol.found, 1) == 0) {
+    memcpy(sol.hash, hash, 32);
+    memcpy(sol.nonce, nonce, nonce_size);
   }
 }
 
@@ -129,38 +140,29 @@ int main(int argc, char *argv[]) {
 
   char *input = argv[1];
   char *target = argv[2];
-  const size_t input_size = strlen(input);
-  const size_t target_size = strlen(target);
 
   cudaDeviceSetCacheConfig(cudaFuncCachePreferShared);
   sha256_preflight();
 
-  // @TODO: use a struct for job
-
-  // copy input to device
-  char *dev_input = nullptr;
-  cudaMalloc(&dev_input, input_size + 1);
-  cudaMemcpy(dev_input, input, input_size + 1, cudaMemcpyHostToDevice);
-
-  // copy target to device
-  char *dev_target = nullptr;
-  cudaMalloc(&dev_target, target_size + 1);
-  cudaMemcpy(dev_target, target, target_size + 1, cudaMemcpyHostToDevice);
-
-  // @TODO: use a struct for solution
+  // initialize job
+  Job job;
+  job.input_size = strlen(input);
+  job.target_size = strlen(target);
+  cudaMalloc(&(job.input), job.input_size + 1);
+  cudaMalloc(&(job.target), job.target_size + 1);
+  cudaMemcpy(job.input, input, job.input_size + 1, cudaMemcpyHostToDevice);
+  cudaMemcpy(job.target, target, job.target_size + 1, cudaMemcpyHostToDevice);
 
   // initialize solution
-  int *sol_found = nullptr;
-  char *sol_nonce = nullptr;
-  unsigned char *sol_hash = nullptr;
-  cudaMallocManaged(&sol_found, sizeof(int));
-  cudaMallocManaged(&sol_nonce, input_size + 32 + 1);
-  cudaMallocManaged(&sol_hash, 32);
+  Solution sol;
+  cudaMallocManaged(&(sol.found), sizeof(int));
+  cudaMallocManaged(&(sol.nonce), job.input_size + 32 + 1);
+  cudaMallocManaged(&(sol.hash), 32);
 
   // initialize loop variables
   static uint64_t nonce = 0;
   size_t dynamic_shared_size =
-      (ceil((input_size + 1) / 8.f) * 8) + (64 * BLOCK_SIZE);
+      (ceil((job.input_size + 1) / 8.f) * 8) + (64 * BLOCK_SIZE);
 
   // initialize hashrate values
   float hashrate = 0.0;
@@ -169,10 +171,9 @@ int main(int argc, char *argv[]) {
   time_t time_last_ms = time_start_ms;
 
   // loop until solution has been found
-  while (!*sol_found) {
-    sha256_kernel<<<NUM_BLOCKS, BLOCK_SIZE, dynamic_shared_size>>>(
-        dev_input, input_size, dev_target, target_size, nonce, sol_found,
-        sol_nonce, sol_hash);
+  while (!*sol.found) {
+    sha256_kernel<<<NUM_BLOCKS, BLOCK_SIZE, dynamic_shared_size>>>(job, nonce,
+                                                                   sol);
 
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
@@ -205,20 +206,20 @@ int main(int argc, char *argv[]) {
 
   // print results
   printf("\nfound solution in %.2fs with %.2f%% luck", duration, luck);
-  printf("\ninput: %s%s", input, sol_nonce);
-  printf("\nnonce: %s", sol_nonce);
+  printf("\ninput: %s%s", input, sol.nonce);
+  printf("\nnonce: %s", sol.nonce);
   printf("\nhash: ");
   for (uint8_t i = 0; i < 32; ++i) {
-    printf("%02x", sol_hash[i]);
+    printf("%02x", sol.hash[i]);
   }
   printf("\n");
 
   // cleanup device
-  cudaFree(sol_hash);
-  cudaFree(sol_nonce);
-  cudaFree(sol_found);
-  cudaFree(dev_target);
-  cudaFree(dev_input);
+  cudaFree(sol.hash);
+  cudaFree(sol.nonce);
+  cudaFree(sol.found);
+  cudaFree(job.target);
+  cudaFree(job.input);
   cudaDeviceReset();
 
   return 0;
