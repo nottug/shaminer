@@ -9,4 +9,4 @@ usage: ./shaminer {INPUT} {TARGET}
 ```
 
 `{INPUT}` is the seed to hash, `{TARGET}` is the target to match. An example
-could be `./shaminer test 21e800`.
+could be `./shaminer "test input" 21e800`.
